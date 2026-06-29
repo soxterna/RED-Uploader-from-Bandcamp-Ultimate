@@ -1,146 +1,127 @@
 # Exact changes
 
-This documents precisely what [`apply-bandcamp-enhancements.mjs`](apply-bandcamp-enhancements.mjs)
-does to the Upload Assistant script, and the existing code that already covers
-requirements 2 and 3.
+What [`apply-bandcamp-enhancements.mjs`](apply-bandcamp-enhancements.mjs) does to the
+Upload Assistant script. Eight idempotent edits in total.
 
 ---
 
-## 1. Bandcamp → FLAC / 24bit Lossless  (behavioural change — added)
+## 1. Bandcamp → FLAC / 24bit Lossless
 
 ### 1a. JSON / `tralbum` path in `bcParser`
 
-**Before**
-
-```js
-				track_number: (tralbum.initial_track_num || 0) + (track.track_num || index + 1),
-				total_tracks: releaseMeta != null && releaseMeta.numTracks ? releaseMeta.numTracks : tralbum.trackinfo.length,
-				media: 'WEB',
-				cover_url: imgUrl,
-```
-
-**After**
-
-```js
-				track_number: (tralbum.initial_track_num || 0) + (track.track_num || index + 1),
-				total_tracks: releaseMeta != null && releaseMeta.numTracks ? releaseMeta.numTracks : tralbum.trackinfo.length,
-				media: 'WEB',
-				encoding: 'lossless',
-				codec: 'FLAC',
-				bitdepth: 24,
-				cover_url: imgUrl,
+```diff
+ 				total_tracks: releaseMeta != null && releaseMeta.numTracks ? releaseMeta.numTracks : tralbum.trackinfo.length,
+ 				media: 'WEB',
++				encoding: 'lossless',
++				codec: 'FLAC',
++				bitdepth: 24,
+ 				cover_url: imgUrl,
 ```
 
 ### 1b. HTML fallback path in `bcParser`
 
-**Before**
-
-```js
-				return Array.from(trs = response.document.querySelectorAll('table#track_table > tbody > tr.track_row_view'), tr => ({
-					artist: isVA ? VA : undefined,
-					artists: !isVA ? artist : undefined,
-					album: album,
-					//album_year: extractYear(releaseDate),
-					release_date: releaseDate,
-					label: label,
-					media: media,
-					genre: tags.toString(),
+```diff
+ 				return Array.from(trs = response.document.querySelectorAll('table#track_table > tbody > tr.track_row_view'), tr => ({
+ 					...
+ 					media: media,
++					encoding: 'lossless',
++					codec: 'FLAC',
++					bitdepth: 24,
+ 					genre: tags.toString(),
 ```
 
-**After**
-
-```js
-				return Array.from(trs = response.document.querySelectorAll('table#track_table > tbody > tr.track_row_view'), tr => ({
-					artist: isVA ? VA : undefined,
-					artists: !isVA ? artist : undefined,
-					album: album,
-					//album_year: extractYear(releaseDate),
-					release_date: releaseDate,
-					label: label,
-					media: media,
-					encoding: 'lossless',
-					codec: 'FLAC',
-					bitdepth: 24,
-					genre: tags.toString(),
-```
-
-### Why this is enough
-
-In `parseTracks`, the form is filled from the aggregated release values:
-
-```js
-if (elementWritable(ref = formItem('format'))) {
-	if (allowedFormats.includes(release.codec)) ref.value = release.codec; else ref.selectedIndex = 0;
-	notifyChange(ref);                       // -> Format = FLAC
-}
-let encoding;
-if (release.encoding == 'lossless') {
-	if (release.bitdepths.includes(24)) encoding = '24bit Lossless';   // <-- matched
-	else if (release.bitdepths.some(bitdepth => bitdepth > 0)) encoding = 'Lossless';
-}
-...
-if ((ref = formItem('bitrate')) != null && !ref.disabled && (overwrite || !br_isSet)) {
-	ref.value = encoding || '';              // -> Bitrate = 24bit Lossless
-	notifyChange(ref);
-}
-```
-
-`bitrateWhitelist('FLAC')` for non-CD media (`media: 'WEB'`) is `(?:24bit )?Lossless`,
-so `24bit Lossless` is a valid option in the dropdown.
+**Why:** in `parseTracks`, `release.codec` → *Format = FLAC*, and
+`release.encoding === 'lossless'` with `release.bitdepths.includes(24)` →
+`encoding = '24bit Lossless'` → *Bitrate = 24bit Lossless*. `bitrateWhitelist('FLAC')`
+for `media: 'WEB'` is `(?:24bit )?Lossless`, so the option is valid.
 
 ---
 
-## 2. Cover auto-fetch + auto-upload  (already present — verified, not changed)
+## 2. Cover rehost → ImgBB (with API key)
 
-`bcParser` already sets the full-resolution cover (`_0`) on every track:
+### 2a. RED rehost list
 
-```js
-if (releaseMeta != null && releaseMeta.image) imgUrl = releaseMeta.image.replace(/_\d+(?=\.\w+$)/, '_0');
-...
-cover_url: imgUrl,
+```diff
+ 	// rehost image hosts
+-	isRED ? ['PTPimg'/*, 'Imgur'*/] : isNWCD ? ['NWCD'] : isDIC ? ['PTPimg', 'PixHost', 'PostImage']
++	isRED ? ['ImgBB', 'PTPimg'] : isNWCD ? ['NWCD'] : isDIC ? ['PTPimg', 'PixHost', 'PostImage']
+ 		: ['PTPimg', 'ImgBB', 'PixHost', 'PostImage'],
 ```
 
-`parseTracks` collects these into `release.coverUrls` and calls:
+### 2b. ImgBB key via GM value (before the manager is constructed)
 
-```js
-if (elementWritable(i = findImageInput())) setCover(release.coverUrls[0]).then(...)
+```diff
++// ImgBB API key for Bandcamp cover rehosting (added by apply-bandcamp-enhancements)
++GM_setValue('imgbb_api_key', '50b144a5dc7ea978a05d76002b79452f');
+ var imageHosts = new ImageHostManager(
 ```
 
-`setCover()` verifies the URL, previews it, checks the size, and — when
-`prefs.auto_rehost_cover` is on (default) — re-hosts it via `imageHosts` and writes the
-re-hosted URL into the *Image* field. No change required.
+### 2c. ImgBB key on the live handler (after construction)
+
+Inserted right after the `new ImageHostManager(...)` statement:
+
+```js
+/* imgbb-key-setup (added by apply-bandcamp-enhancements) */
+try {
+	if (typeof imageHostHandlers == 'object' && imageHostHandlers) for (let _h of ['imgbb', 'ImgBB'])
+		if (imageHostHandlers[_h]) {
+			imageHostHandlers[_h].apiKey = '50b144a5dc7ea978a05d76002b79452f';
+			for (let _p of ['apikey', 'key', 'api_key'])
+				if (_p in imageHostHandlers[_h]) imageHostHandlers[_h][_p] = '50b144a5dc7ea978a05d76002b79452f';
+		}
+} catch (_e) { console.warn('ImgBB key setup failed:', _e); }
+```
+
+**Why two ways:** the image-host library is minified and couldn't be fetched in this
+environment, so the key is set via the standard GM value *and* directly on the live
+`imageHostHandlers.imgbb` instance (the script already uses `imageHostHandlers.imgur` /
+`.abload`, and `PTPimg` instances carry `.apiKey` — so `imgbb.apiKey` is the expected
+shape). The `try/catch` guarantees it can never break page load.
 
 ---
 
-## 3. Bandcamp link in the torrent description  (already present — verified, not changed)
+## 3. Bandcamp link: RELEASE INFO → ALBUM INFO
 
-Every Bandcamp track carries its page URL:
+### 3a. Append source/store links to the album description
 
-```js
-url: releaseMeta != null && releaseMeta.mainEntityOfPage ? releaseMeta.mainEntityOfPage : tralbum.url || response.finalUrl,
+```diff
++		if (sourceUrl || release.urls.length > 0) {
++			const _bcSourceLinks = getReleaseUrls();
++			if (_bcSourceLinks) description += (description ? '\n\n' : '') + _bcSourceLinks;
++		}
+ 		const finalizeDesc = elem => fetchOnlineAdditions().then(t => { description += '\n\n' + t }, reason => { }).then(function() {
+ 			if (description) elem.value += '\n\n' + description.trim();   // <-- writes album_desc
 ```
 
-`parseTracks` aggregates these into `release.urls`, and the upload branch pushes them
-into the release description:
+### 3b. Remove the links from the release description (RED path)
 
-```js
-if (sourceUrl || release.urls.length > 0) rlsDesc.push(getReleaseUrls());
+```diff
+ 			if (lineage.length > 0) rlsDesc.push(lineage);
+ 			finRlsDesc();
+-			if (sourceUrl || release.urls.length > 0) rlsDesc.push(getReleaseUrls());
++			/* source/store links moved to ALBUM INFO (album_desc) */
 ```
 
-`getReleaseUrls()` renders each URL through `getLinkCode()`, which already maps Bandcamp:
+### 3c. Remove the links from the `release_lineage` path (non-RED trackers)
 
-```js
-'bandcamp.com': ['https://ptpimg.me/vwki92.jpg', 'Bandcamp'],
+```diff
+ 			finRlsDesc();
+-			if (sourceUrl || release.urls.length > 0) lineage.push(getReleaseUrls());
++			/* source/store links moved to ALBUM INFO (album_desc) */
 ```
 
-So the description gets a `[url=…]Bandcamp[/url]` link to the album. No change required.
+**Why:** `getReleaseUrls()` (= `release.urls` + store URLs, rendered via `getLinkCode()`,
+which maps `bandcamp.com` → `Bandcamp`) is now appended to the `description` accumulator
+that `finalizeDesc()` writes into `album_desc`, and removed from the `release_desc` /
+`release_lineage` paths. For a Bandcamp upload that link is just the Bandcamp URL.
 
 ---
 
 ## Verification performed
 
-- Applied both insertions against a fixture mirroring the two `bcParser` regions —
-  correct anchors, correct (tab- or space-) indentation.
+- All eight edits applied against a fixture mirroring every anchor region (correct
+  anchors, correct tab/space indentation).
 - `node --check` passes on the transformed output.
-- Idempotent: re-running on an already-enhanced file produces an identical result.
+- Idempotent: re-running on an already-enhanced file produces an identical result and
+  skips all eight edits.
 - Fails safe: a file without the expected anchors errors clearly and writes nothing.
