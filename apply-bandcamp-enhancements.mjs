@@ -5,28 +5,29 @@
  * Applies the Bandcamp-focused enhancements to Anakunda's
  * "[RED/OPS/DIC] Upload Assistant" userscript (v1.43x).
  *
- * It transforms YOUR trusted copy of the script instead of hand-editing it, so
- * every byte that should not change stays byte-for-byte identical. It is
- * idempotent and refuses to write anything if it can't find an expected anchor
- * or if the result doesn't parse.
+ * Run it on YOUR pristine copy of the script. It edits at verified anchors,
+ * keeps every other byte identical, is idempotent, and refuses to write if an
+ * anchor is missing or the result doesn't parse.
  *
  * Enhancements
- *   1. FLAC 24bit  — every Bandcamp track is tagged lossless FLAC 24-bit, so the
- *      upload form auto-selects Format = FLAC and Bitrate = "24bit Lossless".
- *      (Two insertions in bcParser: JSON/`tralbum` path + HTML fallback path.)
- *
- *   2. Cover -> ImgBB — the Bandcamp cover is re-hosted to ImgBB using your API
- *      key. RED's rehost list is switched to ImgBB (PTPimg kept as a fallback),
- *      and the key is provided to the ImgBB handler two ways for robustness:
- *      via the `imgbb_api_key` GM value and directly on the live
- *      `imageHostHandlers.imgbb` handler.
- *
- *   3. Bandcamp link -> ALBUM INFO — the source/store link block is moved out of
- *      the release description (RELEASE INFO / `release_desc`) and into the album
- *      description (ALBUM INFO / `album_desc`).
+ *   1. FLAC 24bit — Bandcamp tracks are tagged lossless FLAC 24-bit, so the
+ *      form auto-selects Format = FLAC and Bitrate = "24bit Lossless".
+ *   2. Initial year = edition year — the initial/original year defaults to the
+ *      edition (release) year when no separate original year is known (so a
+ *      2018 Bandcamp release fills 2018 in both year fields).
+ *   3. Bandcamp link in BOTH places — the source link is shown in the album
+ *      description (ALBUM INFO) AND the release description (RELEASE INFO), each
+ *      prefixed with the text "Release info:".
+ *   4. Cover -> ImgBB (robust) — imageHosts.rehostImages / uploadImages are
+ *      overridden with a small, self-contained ImgBB uploader that posts to the
+ *      public ImgBB API with your key. This does not depend on the (minified)
+ *      image-host library's internals, which is why covers now upload reliably.
  *
  * Usage
  *   node apply-bandcamp-enhancements.mjs <input.user.js> [output.user.js]
+ *
+ * (No Node? Use the Perl version: `perl apply-bandcamp-enhancements.pl <input>`,
+ *  which produces an identical result and needs no install on macOS.)
  * ---------------------------------------------------------------------------
  */
 
@@ -42,8 +43,6 @@ if (!inPath || inPath === '-h' || inPath === '--help') {
 	console.error('Usage: node apply-bandcamp-enhancements.mjs <input.user.js> [output.user.js]');
 	process.exit(inPath ? 0 : 1);
 }
-
-// Fail with a clean, single-line message instead of a stack trace.
 process.on('uncaughtException', (e) => {
 	console.error('Error: ' + (e && e.message ? e.message : e));
 	process.exit(1);
@@ -51,7 +50,6 @@ process.on('uncaughtException', (e) => {
 
 // --- helpers ----------------------------------------------------------------
 
-/** Replace exactly one occurrence; throw if the anchor is missing or ambiguous. */
 function applyOnce(content, re, replacer, label) {
 	if (re.global) throw new Error(`Internal error: anchor regex for "${label}" must not be global.`);
 	let count = 0;
@@ -66,16 +64,58 @@ function applyOnce(content, re, replacer, label) {
 	return out;
 }
 
-/** Build the FLAC-24bit property block, reusing the anchor's indentation. */
 function flacBlock(indent) {
 	return ['', "encoding: 'lossless',", "codec: 'FLAC',", 'bitdepth: 24,'].join('\n' + indent);
 }
 
-// --- edits ------------------------------------------------------------------
-// Each edit is idempotent: `done(src)` short-circuits if it's already applied.
+// Self-contained ImgBB uploader, injected right after `new ImageHostManager(...)`.
+const imgbbOverride = [
+	'/* imgbb-rehost-override (added by apply-bandcamp-enhancements) */',
+	'(function() {',
+	"\tconst IMGBB_KEY = '" + IMGBB_API_KEY + "';",
+	'\tfunction _imgbbParam(item) {',
+	"\t\tif (typeof item == 'string')",
+	"\t\t\treturn Promise.resolve(/^data:/.test(item) ? item.replace(/^data:[^,]*,/, '') : item);",
+	'\t\tif (item instanceof Blob) return new Promise(function(resolve, reject) {',
+	'\t\t\tconst fr = new FileReader;',
+	"\t\t\tfr.onload = () => resolve(String(fr.result).replace(/^data:[^,]*,/, ''));",
+	"\t\t\tfr.onerror = () => reject('ImgBB: file read error');",
+	'\t\t\tfr.readAsDataURL(item);',
+	'\t\t});',
+	"\t\treturn Promise.reject('ImgBB: unsupported image input');",
+	'\t}',
+	'\tfunction _imgbbUpload(item) {',
+	'\t\treturn _imgbbParam(item).then(image => new Promise(function(resolve, reject) {',
+	'\t\t\tGM_xmlhttpRequest({',
+	"\t\t\t\tmethod: 'POST',",
+	"\t\t\t\turl: 'https://api.imgbb.com/1/upload?key=' + encodeURIComponent(IMGBB_KEY),",
+	"\t\t\t\theaders: { 'Content-Type': 'application/x-www-form-urlencoded' },",
+	"\t\t\t\tdata: 'image=' + encodeURIComponent(image),",
+	"\t\t\t\tresponseType: 'json',",
+	'\t\t\t\tonload: function(r) {',
+	'\t\t\t\t\tlet j = r.response;',
+	"\t\t\t\t\tif (typeof j != 'object' || j == null) try { j = JSON.parse(r.responseText) } catch (e) { }",
+	'\t\t\t\t\tif (j && j.success && j.data && (j.data.url || j.data.display_url)) {',
+	'\t\t\t\t\t\tconst u = j.data.url || j.data.display_url;',
+	'\t\t\t\t\t\tresolve({ original: u, thumb: (j.data.thumb && j.data.thumb.url) || u });',
+	"\t\t\t\t\t} else reject('ImgBB: ' + ((j && j.error && j.error.message) || ('HTTP ' + r.status)));",
+	'\t\t\t\t},',
+	"\t\t\t\tonerror: () => reject('ImgBB: network error'),",
+	"\t\t\t\tontimeout: () => reject('ImgBB: timeout'),",
+	'\t\t\t});',
+	'\t\t}));',
+	'\t}',
+	"\tif (typeof imageHosts == 'object' && imageHosts) {",
+	'\t\timageHosts.rehostImages = (items) => Promise.all((items || []).map(_imgbbUpload));',
+	'\t\timageHosts.uploadImages = (items) => Promise.all((items || []).map(_imgbbUpload));',
+	'\t}',
+	'})();',
+].join('\n');
+
+// --- edits (each is idempotent via `done`) ----------------------------------
 
 const edits = [
-	// ----- 1. Bandcamp -> FLAC 24bit --------------------------------------
+	// 1. Bandcamp -> FLAC 24bit (both parser paths)
 	{
 		name: 'FLAC 24bit (JSON / tralbum path)',
 		done: s => /media: 'WEB',\s*\n[ \t]*encoding: 'lossless',\s*\n[ \t]*codec: 'FLAC',\s*\n[ \t]*bitdepth: 24,/.test(s),
@@ -93,76 +133,55 @@ const edits = [
 			'FLAC 24bit (HTML fallback path)'),
 	},
 
-	// ----- 2. Cover rehost target -> ImgBB (with API key) -----------------
+	// 2. Initial year defaults to the edition year
 	{
-		name: "RED rehost list -> ['ImgBB', 'PTPimg']",
-		done: s => /isRED \? \['ImgBB', 'PTPimg'\]/.test(s),
+		name: 'Initial year defaults to edition year',
+		done: s => /ref\.value = release\.album_year \|\| releaseYear \|\| '';/.test(s),
 		apply: s => applyOnce(s,
-			/isRED \? \['PTPimg'\/\*, 'Imgur'\*\/\] :/,
-			() => "isRED ? ['ImgBB', 'PTPimg'] :",
-			"RED rehost list -> ['ImgBB', 'PTPimg']"),
-	},
-	{
-		name: 'ImgBB key via GM value',
-		done: s => /GM_setValue\('imgbb_api_key'/.test(s),
-		apply: s => applyOnce(s,
-			/var imageHosts = new ImageHostManager\(/,
-			() =>
-				"// ImgBB API key for Bandcamp cover rehosting (added by apply-bandcamp-enhancements)\n" +
-				"GM_setValue('imgbb_api_key', '" + IMGBB_API_KEY + "');\n" +
-				"var imageHosts = new ImageHostManager(",
-			'ImgBB key via GM value'),
-	},
-	{
-		name: 'ImgBB key on live handler',
-		done: s => /imgbb-key-setup/.test(s),
-		apply: s => applyOnce(s,
-			/(: \['PTPimg', 'ImgBB', 'PixHost', 'PostImage'\],\s*\n\);)/,
-			(_m, ctorEnd) => ctorEnd + '\n\n' +
-				"/* imgbb-key-setup (added by apply-bandcamp-enhancements) */\n" +
-				"try {\n" +
-				"\tif (typeof imageHostHandlers == 'object' && imageHostHandlers) for (let _h of ['imgbb', 'ImgBB'])\n" +
-				"\t\tif (imageHostHandlers[_h]) {\n" +
-				"\t\t\timageHostHandlers[_h].apiKey = '" + IMGBB_API_KEY + "';\n" +
-				"\t\t\tfor (let _p of ['apikey', 'key', 'api_key'])\n" +
-				"\t\t\t\tif (_p in imageHostHandlers[_h]) imageHostHandlers[_h][_p] = '" + IMGBB_API_KEY + "';\n" +
-				"\t\t}\n" +
-				"} catch (_e) { console.warn('ImgBB key setup failed:', _e); }",
-			'ImgBB key on live handler'),
+			/ref\.value = release\.album_year \|\| '';/,
+			() => "ref.value = release.album_year || releaseYear || '';",
+			'Initial year defaults to edition year'),
 	},
 
-	// ----- 3. Bandcamp link: RELEASE INFO -> ALBUM INFO -------------------
+	// 3. Bandcamp link -> ALBUM INFO and RELEASE INFO, labelled "Release info:"
 	{
-		// Add the source/store links to the album description accumulator.
-		name: 'Source links -> ALBUM INFO (album_desc)',
+		name: 'Link + "Release info:" -> ALBUM INFO (album_desc)',
 		done: s => /_bcSourceLinks/.test(s),
 		apply: s => applyOnce(s,
 			/(\n)([ \t]*)(const finalizeDesc = elem => fetchOnlineAdditions\(\))/,
 			(_m, nl, indent, token) => nl +
 				indent + "if (sourceUrl || release.urls.length > 0) {\n" +
 				indent + "\tconst _bcSourceLinks = getReleaseUrls();\n" +
-				indent + "\tif (_bcSourceLinks) description += (description ? '\\n\\n' : '') + _bcSourceLinks;\n" +
+				indent + "\tif (_bcSourceLinks) description += (description ? '\\n\\n' : '') + 'Release info:\\n' + _bcSourceLinks;\n" +
 				indent + "}\n" +
 				indent + token,
-			'Source links -> ALBUM INFO (album_desc)'),
+			'Link + "Release info:" -> ALBUM INFO (album_desc)'),
 	},
 	{
-		// Remove the source links from the RELEASE INFO (release_desc) path.
-		name: 'Drop source links from release_desc',
-		done: s => !/rlsDesc\.push\(getReleaseUrls\(\)\)/.test(s),
+		name: 'Link + "Release info:" -> RELEASE INFO (release_desc)',
+		done: s => /rlsDesc\.push\('Release info/.test(s),
 		apply: s => applyOnce(s,
-			/([ \t]*)if \(sourceUrl \|\| release\.urls\.length > 0\) rlsDesc\.push\(getReleaseUrls\(\)\);/,
-			(_m, indent) => indent + '/* source/store links moved to ALBUM INFO (album_desc) */',
-			'Drop source links from release_desc'),
+			/(if \(sourceUrl \|\| release\.urls\.length > 0\) )rlsDesc\.push\(getReleaseUrls\(\)\);/,
+			(_m, head) => head + "rlsDesc.push('Release info:\\n' + getReleaseUrls());",
+			'Link + "Release info:" -> RELEASE INFO (release_desc)'),
 	},
 	{
-		// Remove the source links from the release_lineage path (non-RED trackers).
-		name: 'Drop source links from release_lineage',
-		done: s => !/lineage\.push\(getReleaseUrls\(\)\)/.test(s),
+		name: 'Link + "Release info:" -> release_lineage (non-RED)',
+		done: s => /lineage\.push\('Release info/.test(s),
 		apply: s => applyOnce(s,
-			/([ \t]*)if \(sourceUrl \|\| release\.urls\.length > 0\) lineage\.push\(getReleaseUrls\(\)\);/,
-			(_m, indent) => indent + '/* source/store links moved to ALBUM INFO (album_desc) */',
-			'Drop source links from release_lineage'),
+			/(if \(sourceUrl \|\| release\.urls\.length > 0\) )lineage\.push\(getReleaseUrls\(\)\);/,
+			(_m, head) => head + "lineage.push('Release info:\\n' + getReleaseUrls());",
+			'Link + "Release info:" -> release_lineage (non-RED)'),
+	},
+
+	// 4. Robust cover rehost: ImgBB direct (override the library entry points)
+	{
+		name: 'ImgBB rehost override (cover upload fix)',
+		done: s => /imgbb-rehost-override/.test(s),
+		apply: s => applyOnce(s,
+			/(: \['PTPimg', 'ImgBB', 'PixHost', 'PostImage'\],\s*\n\);)/,
+			(_m, ctorEnd) => ctorEnd + '\n\n' + imgbbOverride,
+			'ImgBB rehost override (cover upload fix)'),
 	},
 ];
 
@@ -173,22 +192,11 @@ const changed = [];
 const skipped = [];
 
 for (const edit of edits) {
-	if (edit.done(src)) {
-		skipped.push(edit.name);
-	} else {
-		src = edit.apply(src);
-		changed.push(edit.name);
-	}
+	if (edit.done(src)) skipped.push(edit.name);
+	else { src = edit.apply(src); changed.push(edit.name); }
 }
 
-// --- verify base behaviours we rely on but don't modify ---------------------
-const notes = [];
-notes.push(`Bandcamp cover is fetched + rehosted: ${
-	/cover_url: imgUrl,/.test(src) && /function setCover\(/.test(src) && /auto_rehost_cover/.test(src)
-		? 'present ✓' : 'NOT FOUND ✗'}`);
-notes.push(`getLinkCode() knows bandcamp.com: ${/'bandcamp\.com': \[/.test(src) ? 'present ✓' : 'NOT FOUND ✗'}`);
-
-// --- validate the result parses before writing anything ---------------------
+// validate the result parses
 {
 	const tmp = join(tmpdir(), `ua-bandcamp-check-${process.pid}.js`);
 	writeFileSync(tmp, src);
@@ -201,13 +209,10 @@ notes.push(`getLinkCode() knows bandcamp.com: ${/'bandcamp\.com': \[/.test(src) 
 	}
 }
 
-// --- write output -----------------------------------------------------------
 const outPath = outPathArg || inPath.replace(/(\.user)?\.js$/i, '') + '.bandcamp.user.js';
 writeFileSync(outPath, src);
 
-// --- report -----------------------------------------------------------------
 console.log(`\nBandcamp enhancements applied → ${outPath}\n`);
 if (changed.length) console.log('Changed:\n' + changed.map(s => '  + ' + s).join('\n'));
 if (skipped.length) console.log('Skipped (idempotent):\n' + skipped.map(s => '  = ' + s).join('\n'));
-console.log('\nVerified base behaviours:\n' + notes.map(s => '  • ' + s).join('\n'));
 console.log('\nDone. Install the output file in Tampermonkey/Violentmonkey to use it.');

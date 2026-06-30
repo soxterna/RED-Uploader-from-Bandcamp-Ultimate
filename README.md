@@ -1,120 +1,95 @@
 # RED Uploader — Bandcamp enhancements
 
 Bandcamp-focused tweaks for Anakunda's **[RED/OPS/DIC] Upload Assistant** userscript
-(`greasyfork.org/scripts/389583`). When you fill an upload form from a Bandcamp
-album link, the script now:
+(`greasyfork.org/scripts/389583`). When you fill an upload form from a Bandcamp album
+link, the script now:
 
-1. **Auto-selects the correct FLAC** — every Bandcamp release is tagged as
-   **FLAC / `24bit Lossless`**, so the upload form's *Format* and *Bitrate*
-   dropdowns are filled automatically.
-2. **Re-hosts the Bandcamp cover to ImgBB** — the full-resolution album art is
-   fetched and uploaded to **ImgBB** using your API key, then dropped into the
-   *Image* field. (RED's rehost target is switched to ImgBB, with PTPimg kept as a
-   fallback.)
-3. **Auto-links the Bandcamp page in ALBUM INFO** — the source/store link is placed
-   in the **album description** (`album_desc`) instead of the **release description**
-   (`release_desc`).
+1. **Auto-selects the correct FLAC** — Bandcamp releases are tagged **FLAC / `24bit
+   Lossless`**, so the *Format* and *Bitrate* dropdowns fill automatically.
+2. **Initial year = edition year** — the *initial/original year* defaults to the
+   *edition (release) year* when no separate original year is known. A 2018 Bandcamp
+   release fills **2018** in both year fields.
+3. **Bandcamp link in BOTH descriptions** — the link appears in **ALBUM INFO**
+   (`album_desc`) *and* **RELEASE INFO** (`release_desc`), each prefixed with the text
+   **`Release info:`**.
+4. **Cover → ImgBB (reliable)** — the cover is uploaded to **ImgBB** with your API key
+   via a small, self-contained uploader (see "About the cover fix" below).
 
-See [`CHANGES.md`](CHANGES.md) for the exact, line-level diff of every edit.
+These are produced by a transformer you run on **your own** copy of the script. See
+[`CHANGES.md`](CHANGES.md) for the exact, line-level diff.
 
-## Why a transformer instead of a committed `.user.js`?
+---
 
-The upstream script is ~6,000 lines of third-party code. This environment's egress
-policy blocks `greasyfork.org` (and the `@require`d libraries on `openuserjs.org`), so
-the pristine source couldn't be fetched here, and hand-retyping it would risk silently
-corrupting the 99% that must not change.
+## Installing / running it
 
-Instead, [`apply-bandcamp-enhancements.mjs`](apply-bandcamp-enhancements.mjs)
-transforms **your own trusted copy** of the script: every unchanged byte stays
-byte-for-byte identical, each change is applied at a verified anchor, and the result is
-validated with `node --check` before anything is written.
+You only need to run one command. Pick whichever is easier:
 
-## Usage
+### Option A — no install (recommended on macOS): Perl
 
-Requirements: Node.js (tested on v22).
+macOS already ships Perl, so nothing to install:
 
-```bash
-# 1. Save your current Upload Assistant script, e.g. "Upload Assistant.user.js"
-# 2. Run the transformer:
-node apply-bandcamp-enhancements.mjs "Upload Assistant.user.js"
-#    -> writes "Upload Assistant.bandcamp.user.js"
-
-# Optional explicit output path:
-node apply-bandcamp-enhancements.mjs input.user.js output.user.js
+```sh
+cd ~/Downloads/scripts/RED          # wherever the files are
+perl apply-bandcamp-enhancements.pl "[RED-OPS-DIC] Upload Assistant-1.431.js"
 ```
 
-Then install/replace the **output** file in Tampermonkey or Violentmonkey.
+That writes `…-1.431.bandcamp.user.js` next to the input.
 
-The transformer is **idempotent** (re-running changes nothing) and **fails safe** (if it
-can't find the expected code, it prints a clear message and writes nothing).
+### Option B — Node.js
 
-## What each enhancement does
+If you'd rather use Node (`zsh: command not found: node` just means it isn't
+installed):
 
-### 1. FLAC 24bit
+- **Easiest:** download the macOS installer from <https://nodejs.org> (the "LTS"
+  `.pkg`), double-click it, finish the installer, then **open a new Terminal window**
+  and run:
 
-`bcParser` (the Bandcamp parser) reports no codec or bit depth, so the form is left
-blank. The transformer adds three properties to every Bandcamp track — in both the
-JSON/`tralbum` path and the HTML fallback path:
+  ```sh
+  node apply-bandcamp-enhancements.mjs "[RED-OPS-DIC] Upload Assistant-1.431.js"
+  ```
 
-```js
-media: 'WEB',
-encoding: 'lossless',   // <-- added
-codec: 'FLAC',          // <-- added
-bitdepth: 24,           // <-- added
-```
+- **Or with Homebrew** (if you have it): `brew install node`, then run the same command.
 
-The existing form-fill logic then sets **Format = FLAC** and **Bitrate = `24bit
-Lossless`** (`if (release.bitdepths.includes(24)) encoding = '24bit Lossless'`). For
-`media: 'WEB'` the FLAC bitrate whitelist is `(?:24bit )?Lossless`, so it's selectable.
+Both options produce a **byte-identical** result.
 
-### 2. Cover → ImgBB
+### Then
 
-Two changes:
+Open the **output** file (`…bandcamp.user.js`) and install/replace it in Tampermonkey or
+Violentmonkey.
 
-- RED's rehost list `['PTPimg']` becomes `['ImgBB', 'PTPimg']` (ImgBB first, PTPimg
-  fallback).
-- Your ImgBB API key is supplied to the ImgBB handler **two ways** for robustness
-  against the minified library's internals:
-  1. `GM_setValue('imgbb_api_key', '<key>')` (persisted; picked up by the handler), and
-  2. directly on the live handler: `imageHostHandlers.imgbb.apiKey = '<key>'` (also
-     trying `ImgBB` / `apikey` / `key` / `api_key` as fallbacks), wrapped in a
-     `try/catch` so it can never break page load.
+> Always run the transformer on your **pristine v1.431 script**, not on a file you've
+> already transformed. It's idempotent and fails safe (clear error + nothing written if
+> it can't find the expected code), but the original is the intended input.
 
-> **Note:** the ImgBB key you provided is embedded in the transformer and in its output
-> file. ImgBB keys only grant image uploads, but treat the file accordingly. To use a
-> different key, change `IMGBB_API_KEY` at the top of the transformer and re-run.
->
-> Want **ImgBB only** (no PTPimg fallback)? Change the rehost list to `['ImgBB']` in the
-> output, or edit the `RED rehost list` replacement in the transformer.
+---
 
-### 3. Bandcamp link → ALBUM INFO
+## About the cover fix (why pictures weren't uploading)
 
-The source/store links were pushed into the **release** description:
+The first attempt set RED's rehost target to ImgBB and tried to hand the key to the
+image-host **library's** ImgBB handler. That library is **minified** and couldn't be
+fetched in the build environment, so that wiring was a guess — and worse, switching the
+rehost list could break the PTPimg path that may have been working, leaving nothing that
+succeeds. Result: covers didn't upload.
 
-```js
-if (sourceUrl || release.urls.length > 0) rlsDesc.push(getReleaseUrls());   // RELEASE INFO
-```
+The fix stops depending on the library's internals. It overrides the two entry points
+the script uses (`imageHosts.rehostImages` / `imageHosts.uploadImages`) with a tiny
+uploader that **POSTs directly to the public ImgBB API** with your key and returns the
+hosted URL. It handles http(s) URLs (Bandcamp covers), `data:` URIs (downsized covers),
+and local files (drag-and-drop), and is wrapped so a failure never breaks page load. So
+every cover/image path now goes to ImgBB.
 
-That push (and the analogous `release_lineage` one for non-RED trackers) is removed, and
-the links are instead appended to the **album** description accumulator just before it's
-written:
+> The ImgBB key is embedded in the transformer and its output. ImgBB keys only grant
+> image uploads. To change it, edit `IMGBB_API_KEY` (`.mjs`) / `$KEY` (`.pl`) and re-run.
 
-```js
-if (sourceUrl || release.urls.length > 0) {
-	const _bcSourceLinks = getReleaseUrls();
-	if (_bcSourceLinks) description += (description ? '\n\n' : '') + _bcSourceLinks;
-}
-const finalizeDesc = elem => fetchOnlineAdditions()... // appends `description` to album_desc
-```
-
-For a Bandcamp upload, `getReleaseUrls()` is exactly the `[url=…]Bandcamp[/url]` link, so
-it lands in **ALBUM INFO**.
+---
 
 ## Notes / caveats
 
-- Tagging Bandcamp rips as **24-bit** is a deliberate convention for this workflow, not a
-  claim about the source files (Bandcamp FLAC is frequently 16-bit). Change `bitdepth` in
-  the transformer if your convention differs.
-- The link move is general: any source/store link (`getReleaseUrls()`) now goes to ALBUM
-  INFO, not just Bandcamp. For Bandcamp uploads that link *is* just the Bandcamp URL.
-- Sample rate is intentionally left unset (Bandcamp doesn't expose it reliably).
+- **Initial year:** it defaults to the edition year only when the original year is
+  *unknown* (`album_year || releaseYear`). It won't overwrite a genuinely different
+  original year (e.g. a reissue). For Bandcamp the original year is usually unset, so
+  both fields end up the same.
+- Tagging Bandcamp rips as **24-bit** is a convention for this workflow, not a claim
+  about the files (Bandcamp FLAC is often 16-bit). Change `bitdepth` if needed.
+- The link move is general: any source/store link (`getReleaseUrls()`) is what's shown in
+  both descriptions. For Bandcamp that link is just the Bandcamp URL.

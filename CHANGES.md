@@ -1,7 +1,7 @@
 # Exact changes
 
-What [`apply-bandcamp-enhancements.mjs`](apply-bandcamp-enhancements.mjs) does to the
-Upload Assistant script. Eight idempotent edits in total.
+What the transformer (`apply-bandcamp-enhancements.mjs` / `.pl`, identical output) does to
+the Upload Assistant script. Seven idempotent edits.
 
 ---
 
@@ -21,8 +21,6 @@ Upload Assistant script. Eight idempotent edits in total.
 ### 1b. HTML fallback path in `bcParser`
 
 ```diff
- 				return Array.from(trs = response.document.querySelectorAll('table#track_table > tbody > tr.track_row_view'), tr => ({
- 					...
  					media: media,
 +					encoding: 'lossless',
 +					codec: 'FLAC',
@@ -30,98 +28,118 @@ Upload Assistant script. Eight idempotent edits in total.
  					genre: tags.toString(),
 ```
 
-**Why:** in `parseTracks`, `release.codec` → *Format = FLAC*, and
-`release.encoding === 'lossless'` with `release.bitdepths.includes(24)` →
-`encoding = '24bit Lossless'` → *Bitrate = 24bit Lossless*. `bitrateWhitelist('FLAC')`
-for `media: 'WEB'` is `(?:24bit )?Lossless`, so the option is valid.
+`release.codec` → *Format = FLAC*; `release.encoding === 'lossless'` with
+`release.bitdepths.includes(24)` → `encoding = '24bit Lossless'` → *Bitrate = 24bit
+Lossless*.
 
 ---
 
-## 2. Cover rehost → ImgBB (with API key)
-
-### 2a. RED rehost list
+## 2. Initial year defaults to the edition year
 
 ```diff
- 	// rehost image hosts
--	isRED ? ['PTPimg'/*, 'Imgur'*/] : isNWCD ? ['NWCD'] : isDIC ? ['PTPimg', 'PixHost', 'PostImage']
-+	isRED ? ['ImgBB', 'PTPimg'] : isNWCD ? ['NWCD'] : isDIC ? ['PTPimg', 'PixHost', 'PostImage']
- 		: ['PTPimg', 'ImgBB', 'PixHost', 'PostImage'],
+-			if (elementWritable(ref = formItem('year'))) ref.value = release.album_year || '';
++			if (elementWritable(ref = formItem('year'))) ref.value = release.album_year || releaseYear || '';
 ```
 
-### 2b. ImgBB key via GM value (before the manager is constructed)
-
-```diff
-+// ImgBB API key for Bandcamp cover rehosting (added by apply-bandcamp-enhancements)
-+GM_setValue('imgbb_api_key', '50b144a5dc7ea978a05d76002b79452f');
- var imageHosts = new ImageHostManager(
-```
-
-### 2c. ImgBB key on the live handler (after construction)
-
-Inserted right after the `new ImageHostManager(...)` statement:
-
-```js
-/* imgbb-key-setup (added by apply-bandcamp-enhancements) */
-try {
-	if (typeof imageHostHandlers == 'object' && imageHostHandlers) for (let _h of ['imgbb', 'ImgBB'])
-		if (imageHostHandlers[_h]) {
-			imageHostHandlers[_h].apiKey = '50b144a5dc7ea978a05d76002b79452f';
-			for (let _p of ['apikey', 'key', 'api_key'])
-				if (_p in imageHostHandlers[_h]) imageHostHandlers[_h][_p] = '50b144a5dc7ea978a05d76002b79452f';
-		}
-} catch (_e) { console.warn('ImgBB key setup failed:', _e); }
-```
-
-**Why two ways:** the image-host library is minified and couldn't be fetched in this
-environment, so the key is set via the standard GM value *and* directly on the live
-`imageHostHandlers.imgbb` instance (the script already uses `imageHostHandlers.imgur` /
-`.abload`, and `PTPimg` instances carry `.apiKey` — so `imgbb.apiKey` is the expected
-shape). The `try/catch` guarantees it can never break page load.
+`year` (initial) falls back to `releaseYear` — the same value used for `remaster_year`
+(edition) — when the original year is unknown. A 2018 Bandcamp release fills 2018 in both.
 
 ---
 
-## 3. Bandcamp link: RELEASE INFO → ALBUM INFO
+## 3. Bandcamp link in ALBUM INFO **and** RELEASE INFO, labelled "Release info:"
 
-### 3a. Append source/store links to the album description
+### 3a. Append to the album description (ALBUM INFO / `album_desc`)
 
 ```diff
 +		if (sourceUrl || release.urls.length > 0) {
 +			const _bcSourceLinks = getReleaseUrls();
-+			if (_bcSourceLinks) description += (description ? '\n\n' : '') + _bcSourceLinks;
++			if (_bcSourceLinks) description += (description ? '\n\n' : '') + 'Release info:\n' + _bcSourceLinks;
 +		}
  		const finalizeDesc = elem => fetchOnlineAdditions().then(t => { description += '\n\n' + t }, reason => { }).then(function() {
- 			if (description) elem.value += '\n\n' + description.trim();   // <-- writes album_desc
+ 			if (description) elem.value += '\n\n' + description.trim();   // writes album_desc
 ```
 
-### 3b. Remove the links from the release description (RED path)
+### 3b. Keep it in the release description (RELEASE INFO / `release_desc`), with the label
 
 ```diff
- 			if (lineage.length > 0) rlsDesc.push(lineage);
- 			finRlsDesc();
 -			if (sourceUrl || release.urls.length > 0) rlsDesc.push(getReleaseUrls());
-+			/* source/store links moved to ALBUM INFO (album_desc) */
++			if (sourceUrl || release.urls.length > 0) rlsDesc.push('Release info:\n' + getReleaseUrls());
 ```
 
-### 3c. Remove the links from the `release_lineage` path (non-RED trackers)
+### 3c. Same for the `release_lineage` path (non-RED trackers)
 
 ```diff
- 			finRlsDesc();
 -			if (sourceUrl || release.urls.length > 0) lineage.push(getReleaseUrls());
-+			/* source/store links moved to ALBUM INFO (album_desc) */
++			if (sourceUrl || release.urls.length > 0) lineage.push('Release info:\n' + getReleaseUrls());
 ```
 
-**Why:** `getReleaseUrls()` (= `release.urls` + store URLs, rendered via `getLinkCode()`,
-which maps `bandcamp.com` → `Bandcamp`) is now appended to the `description` accumulator
-that `finalizeDesc()` writes into `album_desc`, and removed from the `release_desc` /
-`release_lineage` paths. For a Bandcamp upload that link is just the Bandcamp URL.
+`getReleaseUrls()` renders `release.urls` + store URLs via `getLinkCode()` (which maps
+`bandcamp.com` → `Bandcamp`). For a Bandcamp upload that is the Bandcamp link, now shown in
+both descriptions under a `Release info:` heading.
+
+---
+
+## 4. Cover rehost → ImgBB (robust; fixes "pictures not uploading")
+
+Injected right after `var imageHosts = new ImageHostManager(...)`:
+
+```js
+/* imgbb-rehost-override (added by apply-bandcamp-enhancements) */
+(function() {
+	const IMGBB_KEY = '50b144a5dc7ea978a05d76002b79452f';
+	function _imgbbParam(item) {
+		if (typeof item == 'string')
+			return Promise.resolve(/^data:/.test(item) ? item.replace(/^data:[^,]*,/, '') : item);
+		if (item instanceof Blob) return new Promise(function(resolve, reject) {
+			const fr = new FileReader;
+			fr.onload = () => resolve(String(fr.result).replace(/^data:[^,]*,/, ''));
+			fr.onerror = () => reject('ImgBB: file read error');
+			fr.readAsDataURL(item);
+		});
+		return Promise.reject('ImgBB: unsupported image input');
+	}
+	function _imgbbUpload(item) {
+		return _imgbbParam(item).then(image => new Promise(function(resolve, reject) {
+			GM_xmlhttpRequest({
+				method: 'POST',
+				url: 'https://api.imgbb.com/1/upload?key=' + encodeURIComponent(IMGBB_KEY),
+				headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+				data: 'image=' + encodeURIComponent(image),
+				responseType: 'json',
+				onload: function(r) {
+					let j = r.response;
+					if (typeof j != 'object' || j == null) try { j = JSON.parse(r.responseText) } catch (e) { }
+					if (j && j.success && j.data && (j.data.url || j.data.display_url)) {
+						const u = j.data.url || j.data.display_url;
+						resolve({ original: u, thumb: (j.data.thumb && j.data.thumb.url) || u });
+					} else reject('ImgBB: ' + ((j && j.error && j.error.message) || ('HTTP ' + r.status)));
+				},
+				onerror: () => reject('ImgBB: network error'),
+				ontimeout: () => reject('ImgBB: timeout'),
+			});
+		}));
+	}
+	if (typeof imageHosts == 'object' && imageHosts) {
+		imageHosts.rehostImages = (items) => Promise.all((items || []).map(_imgbbUpload));
+		imageHosts.uploadImages = (items) => Promise.all((items || []).map(_imgbbUpload));
+	}
+})();
+```
+
+**Why an override:** `setCover()` (auto cover), `inputDataHandler` (drag a cover into the
+Image field) and `textAreaDropHandler` (images in descriptions) all go through
+`imageHosts.rehostImages` / `imageHosts.uploadImages`. Overriding those two routes every
+image path through a direct ImgBB API call — no dependency on the minified library's ImgBB
+handler, key storage, or rehost-list. The returned `{ original, thumb }` shape matches what
+the script's `singleImageGetter` / `urlHandler` already consume. This replaces the earlier,
+fragile approach (rehost-list swap + GM value + poking `imageHostHandlers.imgbb`).
 
 ---
 
 ## Verification performed
 
-- All eight edits applied against a fixture mirroring every anchor region (correct
-  anchors, correct tab/space indentation).
-- `node --check` passes on the transformed output.
-- Idempotent: re-running on an already-enhanced file produces an identical result and
-  skips all eight edits.
-- Fails safe: a file without the expected anchors errors clearly and writes nothing.
+- All seven edits applied against a fixture mirroring every anchor region.
+- The Perl output is **byte-identical** to the Node output.
+- `node --check` passes on both outputs.
+- Idempotent: re-running skips all seven and yields an identical file.
+- Fails safe: missing anchors → clear error, nothing written.
